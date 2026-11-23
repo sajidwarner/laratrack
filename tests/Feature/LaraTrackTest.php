@@ -505,7 +505,7 @@ class LaraTrackTest extends TestCase
 
         $request = Request::create('/', 'GET');
         $request->headers->set('User-Agent', 'Mozilla/5.0 Chrome/120.0.0.0');
-        $request->headers->set('X-Real-IP', '5.5.5.5');
+        $request->server->set('REMOTE_ADDR', '5.5.5.5');
 
         $result = LaraTrack::detect($request);
 
@@ -572,7 +572,7 @@ class LaraTrackTest extends TestCase
 
         $request = Request::create('/', 'GET');
         $request->headers->set('User-Agent', 'Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36');
-        $request->headers->set('X-Real-IP', '8.8.8.8');
+        $request->server->set('REMOTE_ADDR', '8.8.8.8');
 
         $result   = LaraTrack::detect($request);
         $location = $result['location'];
@@ -616,7 +616,7 @@ class LaraTrackTest extends TestCase
 
         $request = Request::create('/', 'GET');
         $request->headers->set('User-Agent', 'Mozilla/5.0 Chrome/120.0.0.0');
-        $request->headers->set('X-Real-IP', '91.128.103.196');
+        $request->server->set('REMOTE_ADDR', '91.128.103.196');
 
         $result1 = LaraTrack::detect($request);
         LaraTrack::getLocation($request);
@@ -638,7 +638,7 @@ class LaraTrackTest extends TestCase
 
         $request = Request::create('/', 'GET');
         $request->headers->set('User-Agent', 'Mozilla/5.0 Chrome/120.0.0.0');
-        $request->headers->set('X-Real-IP', '1.2.3.4');
+        $request->server->set('REMOTE_ADDR', '1.2.3.4');
 
         $result = LaraTrack::detect($request);
 
@@ -674,7 +674,7 @@ class LaraTrackTest extends TestCase
 
         $request = Request::create('/', 'GET');
         $request->headers->set('User-Agent', 'Mozilla/5.0 Chrome/120.0.0.0');
-        $request->headers->set('X-Real-IP', '80.0.0.1');
+        $request->server->set('REMOTE_ADDR', '80.0.0.1');
 
         $location = LaraTrack::getLocation($request);
 
@@ -682,5 +682,181 @@ class LaraTrackTest extends TestCase
         $this->assertEquals('Berlin', $location['city']);
         $this->assertEquals('EUR', $location['currency']);
         $this->assertTrue($location['is_eu']);
+    }
+
+    // -------------------------------------------------------------------------
+    // Client IP
+    // -------------------------------------------------------------------------
+
+    #[Test]
+    public function it_ignores_a_spoofed_x_real_ip_header(): void
+    {
+        $this->enableGeolocation();
+        Http::fake(['api.ipgeolocation.io/*' => Http::response($this->geoResponse('Germany', 'DE', 'Berlin'), 200)]);
+
+        $request = $this->requestFrom('80.0.0.1');
+        $request->headers->set('X-Real-IP', '8.8.8.8');
+
+        $result = LaraTrack::detect($request);
+
+        $this->assertEquals('80.0.0.1', $result['ip']);
+        Http::assertSent(fn ($sent) => $sent['ip'] === '80.0.0.1');
+    }
+
+    #[Test]
+    public function it_does_not_send_private_ips_to_the_geolocation_api(): void
+    {
+        $this->enableGeolocation();
+        Http::fake();
+
+        $result = LaraTrack::detect($this->requestFrom('192.168.1.5'));
+
+        $this->assertEmpty($result['location']);
+        Http::assertNothingSent();
+    }
+
+    #[Test]
+    public function lookup_ip_works_without_a_request(): void
+    {
+        $this->enableGeolocation();
+        Http::fake(['api.ipgeolocation.io/*' => Http::response($this->geoResponse('Bangladesh', 'BD', 'Dhaka'), 200)]);
+
+        $location = LaraTrack::lookupIp('103.4.145.1');
+
+        $this->assertEquals('BD', $location['country_code']);
+        $this->assertEquals('Dhaka', $location['city']);
+    }
+
+    // -------------------------------------------------------------------------
+    // Failed lookups are not cached for long
+    // -------------------------------------------------------------------------
+
+    #[Test]
+    public function a_failed_geolocation_lookup_is_retried_after_the_failure_window(): void
+    {
+        $this->enableGeolocation();
+        Http::fake([
+            'api.ipgeolocation.io/*' => Http::sequence()
+                ->push([], 500)
+                ->push($this->geoResponse('Germany', 'DE', 'Berlin'), 200),
+        ]);
+
+        $this->assertEmpty(LaraTrack::lookupIp('80.0.0.1'));
+
+        // Inside the failure window the API is not called again.
+        $this->assertEmpty(LaraTrack::lookupIp('80.0.0.1'));
+        Http::assertSentCount(1);
+
+        $this->travel(61)->seconds();
+
+        $this->assertEquals('Berlin', LaraTrack::lookupIp('80.0.0.1')['city']);
+        Http::assertSentCount(2);
+    }
+
+    #[Test]
+    public function a_failed_tor_list_download_is_retried_after_the_failure_window(): void
+    {
+        Cache::flush();
+        config(['laratrack.enable_tor_detection' => true, 'laratrack.fire_events' => false]);
+        Http::fake([
+            'check.torproject.org/*' => Http::sequence()
+                ->push('', 500)
+                ->push("ExitNode ABC\nExitAddress 185.220.101.1 2026-01-01 00:00:00\n", 200),
+        ]);
+
+        $this->assertFalse(LaraTrack::detect($this->requestFrom('185.220.101.1'))['is_tor']);
+
+        $this->travel(61)->seconds();
+
+        $this->assertTrue(LaraTrack::detect($this->requestFrom('185.220.101.1'))['is_tor']);
+    }
+
+    // -------------------------------------------------------------------------
+    // Client Hints (Sec-CH-UA)
+    // -------------------------------------------------------------------------
+
+    #[Test]
+    public function it_detects_brave_from_client_hints(): void
+    {
+        $request = $this->chromeRequestWithHints('"Brave";v="120", "Chromium";v="120", "Not_A Brand";v="24"');
+
+        $this->assertEquals('Brave', LaraTrack::detect($request)['browser']);
+    }
+
+    #[Test]
+    public function it_detects_opera_gx_from_client_hints(): void
+    {
+        $request = $this->chromeRequestWithHints('"Opera GX";v="105", "Chromium";v="119", "Not?A_Brand";v="24"');
+
+        $this->assertEquals('Opera GX', LaraTrack::detect($request)['browser']);
+    }
+
+    #[Test]
+    public function it_detects_chrome_from_client_hints(): void
+    {
+        $request = $this->chromeRequestWithHints('"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"');
+
+        $result = LaraTrack::detect($request);
+
+        $this->assertEquals('Google Chrome', $result['browser']);
+        $this->assertEquals('120.0.0.0', $result['browser_version']);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test route
+    // -------------------------------------------------------------------------
+
+    #[Test]
+    public function the_artisan_test_command_uses_the_given_ip(): void
+    {
+        $this->artisan('laratrack:test', ['--ip' => '80.0.0.1'])
+            ->expectsOutputToContain('80.0.0.1')
+            ->assertSuccessful();
+    }
+
+    #[Test]
+    public function the_test_route_is_not_registered_outside_local(): void
+    {
+        $this->get('/laratrack/test')->assertNotFound();
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private function enableGeolocation(): void
+    {
+        Cache::flush();
+        config([
+            'laratrack.enable_ip_geolocation'  => true,
+            'laratrack.ip_geolocation_api_key' => 'test-api-key',
+            'laratrack.fire_events'            => false,
+        ]);
+    }
+
+    private function requestFrom(string $ip): Request
+    {
+        $request = Request::create('/', 'GET', server: ['REMOTE_ADDR' => $ip]);
+        $request->headers->set('User-Agent', 'Mozilla/5.0 Chrome/120.0.0.0');
+
+        return $request;
+    }
+
+    private function chromeRequestWithHints(string $secChUa): Request
+    {
+        $request = Request::create('/', 'GET');
+        $request->headers->set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        $request->headers->set('Sec-CH-UA', $secChUa);
+
+        return $request;
+    }
+
+    private function geoResponse(string $country, string $code, string $city): array
+    {
+        return [
+            'country_name'  => $country,
+            'country_code2' => $code,
+            'city'          => $city,
+        ];
     }
 }

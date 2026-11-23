@@ -30,7 +30,7 @@ class LaraTrackServiceProvider extends ServiceProvider
             __DIR__ . '/../config/laratrack.php' => config_path('laratrack.php'),
         ], 'laratrack-config');
 
-        if (!$this->app->environment('production')) {
+        if ($this->app->environment('local') && config('laratrack.enable_test_route', true)) {
             $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         }
 

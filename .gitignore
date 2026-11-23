@@ -12,3 +12,4 @@ Thumbs.db
 .env
 node_modules/
 /coverage
+/.phpunit.cache

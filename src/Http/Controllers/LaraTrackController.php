@@ -21,6 +21,7 @@ class LaraTrackController extends Controller
                 'Sec-CH-UA'        => $request->header('Sec-CH-UA'),
                 'Sec-CH-UA-Platform' => $request->header('Sec-CH-UA-Platform'),
                 'X-Real-IP'        => $request->header('X-Real-IP'),
+                'X-Forwarded-For'  => $request->header('X-Forwarded-For'),
             ],
         ]);
     }

@@ -18,6 +18,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static bool   isProxy(\Illuminate\Http\Request $request = null)
  * @method static string getLanguage(\Illuminate\Http\Request $request = null)
  * @method static array  getLocation(\Illuminate\Http\Request $request = null)
+ * @method static array  lookupIp(string $ip)
  *
  * @see \SajidWarner\LaraTrack\LaraTrack
  */

@@ -373,6 +373,29 @@ echo $location['currency'];     // BDT
 echo $location['calling_code']; // +880
 ```
 
+4. Look up any IP without a request (for example in a queued job, so the
+   API call never slows down a login):
+
+```php
+$location = LaraTrack::lookupIp('103.4.145.1'); // [] on failure
+```
+
+### Client IP & Proxies
+
+LaraTrack uses `$request->ip()`. Headers like `X-Real-IP` or `X-Forwarded-For`
+are **not** read directly, because any visitor can send them. If your app runs
+behind Nginx, a load balancer or Cloudflare, list the proxy in Laravel's
+[TrustProxies](https://laravel.com/docs/requests#configuring-trusted-proxies)
+setup; then `$request->ip()` returns the real visitor IP.
+
+### Caching & Failures
+
+- Private and reserved IPs (`127.0.0.1`, `192.168.x.x`, …) are never sent to the API.
+- A successful lookup is cached for `LARATRACK_GEO_CACHE` seconds (default 3600).
+- A failed lookup (timeout, HTTP error) is **not** cached as an empty result;
+  LaraTrack waits `LARATRACK_FAILURE_CACHE` seconds (default 60) and then tries
+  again. The Tor exit list follows the same rule.
+
 ### Geolocation Response Fields
 
 | Field | Description | Example |
@@ -396,12 +419,12 @@ echo $location['calling_code']; // +880
 
 | Browser | Detection Method |
 |---------|-----------------|
-| Google Chrome | User-Agent + Sec-CH-UA |
+| Google Chrome | Sec-CH-UA + User-Agent |
 | Mozilla Firefox | User-Agent |
 | Safari | User-Agent |
-| Microsoft Edge | User-Agent + Sec-CH-UA |
-| Opera / Opera GX | User-Agent |
-| Brave | User-Agent + Sec-CH-UA |
+| Microsoft Edge | Sec-CH-UA + User-Agent |
+| Opera / Opera GX | Sec-CH-UA + User-Agent |
+| Brave | Sec-CH-UA (Brave's User-Agent looks like Chrome) |
 | Vivaldi | User-Agent |
 | Tor Browser | User-Agent |
 | Kahf Browser | X-Requested-With header |
@@ -457,6 +480,12 @@ return [
     'ip_geolocation_api_url'        => env('LARATRACK_GEO_URL', 'https://api.ipgeolocation.io/v3/ipgeo'),
     'ip_geolocation_cache_duration' => env('LARATRACK_GEO_CACHE', 3600),
 
+    // Retry delay after a failed geolocation / Tor list request
+    'failure_cache_duration' => env('LARATRACK_FAILURE_CACHE', 60),
+
+    // GET /laratrack/test (only when APP_ENV=local)
+    'enable_test_route' => env('LARATRACK_TEST_ROUTE', true),
+
     // Events
     'fire_events' => env('LARATRACK_FIRE_EVENTS', true),
 
@@ -500,15 +529,24 @@ return [
 composer test
 ```
 
-36 tests · 86 assertions · all passing ✅
+52 tests · 117 assertions · all passing ✅
 
-## API Routes (Non-Production Only)
+## Test Route (Local Only)
 
 ```
 GET /laratrack/test
 ```
 
-Returns JSON with full detection data including headers. Disabled automatically in production.
+Returns JSON with full detection data including headers. Registered only when
+`APP_ENV=local` (never on staging or production); turn it off completely with
+`LARATRACK_TEST_ROUTE=false`.
+
+## Upgrading to 1.5
+
+- `X-Real-IP` is no longer trusted directly. Behind a proxy, configure
+  Laravel's TrustProxies so `$request->ip()` returns the visitor's IP.
+- `/laratrack/test` now only exists when `APP_ENV=local` (before: every
+  non-production environment).
 
 ## Security
 

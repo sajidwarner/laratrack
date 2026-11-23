@@ -32,6 +32,25 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Failed Lookups
+    | When the geolocation API or the Tor exit list cannot be reached, wait
+    | this many seconds before trying again. Failures are never cached for
+    | the full cache duration.
+    |--------------------------------------------------------------------------
+    */
+    'failure_cache_duration' => env('LARATRACK_FAILURE_CACHE', 60),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Test Route
+    | GET /laratrack/test returns the detection data as JSON. It is only
+    | registered when APP_ENV is "local" and this option is true.
+    |--------------------------------------------------------------------------
+    */
+    'enable_test_route' => env('LARATRACK_TEST_ROUTE', true),
+
+    /*
+    |--------------------------------------------------------------------------
     | Events
     | Fire Laravel events when bots, Tor, or VPN are detected.
     | Listen to: BotDetected, TorDetected, VpnDetected

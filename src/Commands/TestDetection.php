@@ -16,9 +16,8 @@ class TestDetection extends Command
         $ua = $this->argument('ua') ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
         $ip = $this->option('ip') ?? '127.0.0.1';
 
-        $request = Request::create('/', 'GET');
+        $request = Request::create('/', 'GET', server: ['REMOTE_ADDR' => $ip]);
         $request->headers->set('User-Agent', $ua);
-        $request->headers->set('X-Real-IP', $ip);
 
         $detector = new LaraTrack($request);
         $result   = $detector->detect();

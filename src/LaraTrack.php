@@ -93,49 +93,93 @@ class LaraTrack
             return [];
         }
 
+        return $this->lookupIp($ip);
+    }
+
+    /**
+     * Look up an IP address without a request (e.g. from a queued job).
+     *
+     * Private and reserved addresses are never sent to the API. A successful
+     * answer is cached for `ip_geolocation_cache_duration` seconds; a failed
+     * one only for `failure_cache_duration` seconds, so a short API outage
+     * does not leave the IP without a location for long.
+     */
+    public function lookupIp(string $ip): array
+    {
         $apiKey = config('laratrack.ip_geolocation_api_key', '');
-        if (empty($apiKey)) {
+        if (empty($apiKey) || !$this->isPublicIp($ip)) {
             return [];
         }
 
         $cacheKey = 'laratrack_geo_' . md5($ip);
+        $cached   = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            return $cached;
+        }
 
-        return Cache::remember($cacheKey, config('laratrack.ip_geolocation_cache_duration', 3600), function () use ($ip, $apiKey) {
-            try {
-                $response = Http::timeout(5)->get(
-                    config('laratrack.ip_geolocation_api_url', 'https://api.ipgeolocation.io/v3/ipgeo'),
-                    ['apiKey' => $apiKey, 'ip' => $ip]
-                );
-
-                if ($response->successful()) {
-                    $geo      = $response->json();
-                    $security = $geo['security'] ?? [];
-                    return [
-                        'country'      => $geo['country_name'] ?? null,
-                        'country_code' => $geo['country_code2'] ?? null,
-                        'city'         => $geo['city'] ?? null,
-                        'state'        => $geo['state_prov'] ?? null,
-                        'district'     => $geo['district'] ?? null,
-                        'zip'          => $geo['zipcode'] ?? null,
-                        'latitude'     => $geo['latitude'] ?? null,
-                        'longitude'    => $geo['longitude'] ?? null,
-                        'timezone'     => $geo['time_zone']['name'] ?? null,
-                        'isp'          => $geo['isp'] ?? null,
-                        'organization' => $geo['organization'] ?? null,
-                        'currency'     => $geo['currency']['code'] ?? null,
-                        'calling_code' => $geo['calling_code'] ?? null,
-                        'is_eu'        => $geo['is_eu'] ?? false,
-                        'is_vpn'       => $security['is_vpn'] ?? false,
-                        'is_proxy'     => $security['is_proxy'] ?? false,
-                        'is_datacenter'=> $security['is_datacenter'] ?? false,
-                        'threat_score' => $security['threat_score'] ?? 0,
-                    ];
-                }
-            } catch (\Exception $e) {
-                Log::warning('LaraTrack: Failed to fetch IP geolocation: ' . $e->getMessage());
-            }
+        if (Cache::has($cacheKey . '_failed')) {
             return [];
-        });
+        }
+
+        $geo = $this->fetchIpGeolocation($ip, $apiKey);
+
+        if ($geo === null) {
+            Cache::put($cacheKey . '_failed', true, (int) config('laratrack.failure_cache_duration', 60));
+            return [];
+        }
+
+        Cache::put($cacheKey, $geo, (int) config('laratrack.ip_geolocation_cache_duration', 3600));
+
+        return $geo;
+    }
+
+    protected function isPublicIp(string $ip): bool
+    {
+        return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+    }
+
+    /**
+     * Ask the API about an IP. Returns null when the call fails.
+     */
+    protected function fetchIpGeolocation(string $ip, string $apiKey): ?array
+    {
+        try {
+            $response = Http::timeout(5)->get(
+                config('laratrack.ip_geolocation_api_url', 'https://api.ipgeolocation.io/v3/ipgeo'),
+                ['apiKey' => $apiKey, 'ip' => $ip]
+            );
+
+            if ($response->successful() && is_array($response->json())) {
+                $geo      = $response->json();
+                $security = $geo['security'] ?? [];
+                return [
+                    'country'      => $geo['country_name'] ?? null,
+                    'country_code' => $geo['country_code2'] ?? null,
+                    'city'         => $geo['city'] ?? null,
+                    'state'        => $geo['state_prov'] ?? null,
+                    'district'     => $geo['district'] ?? null,
+                    'zip'          => $geo['zipcode'] ?? null,
+                    'latitude'     => $geo['latitude'] ?? null,
+                    'longitude'    => $geo['longitude'] ?? null,
+                    'timezone'     => $geo['time_zone']['name'] ?? null,
+                    'isp'          => $geo['isp'] ?? null,
+                    'organization' => $geo['organization'] ?? null,
+                    'currency'     => $geo['currency']['code'] ?? null,
+                    'calling_code' => $geo['calling_code'] ?? null,
+                    'is_eu'        => $geo['is_eu'] ?? false,
+                    'is_vpn'       => $security['is_vpn'] ?? false,
+                    'is_proxy'     => $security['is_proxy'] ?? false,
+                    'is_datacenter'=> $security['is_datacenter'] ?? false,
+                    'threat_score' => $security['threat_score'] ?? 0,
+                ];
+            }
+
+            Log::warning('LaraTrack: IP geolocation API answered with HTTP ' . $response->status());
+        } catch (\Exception $e) {
+            Log::warning('LaraTrack: Failed to fetch IP geolocation: ' . $e->getMessage());
+        }
+
+        return null;
     }
 
     protected function detectTor(string $ip): bool
@@ -143,25 +187,44 @@ class LaraTrack
         if (!config('laratrack.enable_tor_detection', true)) {
             return false;
         }
-        return in_array($ip, $this->getTorExitNodes());
+        return in_array($ip, $this->getTorExitNodes(), true);
     }
 
+    /**
+     * The Tor exit list is cached for `tor_cache_duration` seconds. When the
+     * download fails, an empty list is kept only for `failure_cache_duration`
+     * seconds so detection comes back as soon as the list is reachable again.
+     */
     protected function getTorExitNodes(): array
     {
-        return Cache::remember('laratrack_tor_exit_nodes', config('laratrack.tor_cache_duration', 3600), function () {
-            try {
-                $response = Http::timeout(10)->get(
-                    config('laratrack.tor_exit_node_url', 'https://check.torproject.org/exit-addresses')
-                );
-                if ($response->successful()) {
-                    preg_match_all('/ExitAddress\s+([0-9\.]+)/', $response->body(), $matches);
-                    return $matches[1] ?? [];
-                }
-            } catch (\Exception $e) {
-                Log::warning('LaraTrack: Failed to fetch Tor exit nodes: ' . $e->getMessage());
-            }
+        $cacheKey = 'laratrack_tor_exit_nodes';
+        $cached   = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            return $cached;
+        }
+
+        if (Cache::has($cacheKey . '_failed')) {
             return [];
-        });
+        }
+
+        try {
+            $response = Http::timeout(10)->get(
+                config('laratrack.tor_exit_node_url', 'https://check.torproject.org/exit-addresses')
+            );
+            if ($response->successful()) {
+                preg_match_all('/ExitAddress\s+([0-9\.]+)/', $response->body(), $matches);
+                $nodes = $matches[1] ?? [];
+                Cache::put($cacheKey, $nodes, (int) config('laratrack.tor_cache_duration', 3600));
+
+                return $nodes;
+            }
+        } catch (\Exception $e) {
+            Log::warning('LaraTrack: Failed to fetch Tor exit nodes: ' . $e->getMessage());
+        }
+
+        Cache::put($cacheKey . '_failed', true, (int) config('laratrack.failure_cache_duration', 60));
+
+        return [];
     }
 
     protected function detectRobot(string $userAgent): array
@@ -240,14 +303,8 @@ class LaraTrack
             'Chromium'           => ['/chromium/i'],
         ];
 
-        if (!empty($secChUa)) {
-            foreach ($browsers as $name => $patterns) {
-                foreach ($patterns as $pattern) {
-                    if (str_contains($secChUa, strtolower(str_replace('/', '', $pattern)))) {
-                        return ['name' => $name, 'version' => $this->extractVersion($userAgent, $name)];
-                    }
-                }
-            }
+        if (!empty($secChUa) && ($hinted = $this->detectBrowserFromClientHints($secChUa, $userAgent))) {
+            return $hinted;
         }
 
         foreach ($browsers as $name => $patterns) {
@@ -259,6 +316,45 @@ class LaraTrack
         }
 
         return ['name' => 'Unknown', 'version' => ''];
+    }
+
+    /**
+     * Read the browser from the Sec-CH-UA header, e.g.
+     * `"Brave";v="120", "Chromium";v="120", "Not_A Brand";v="24"`.
+     * Brave and Opera GX can only be told apart from Chrome this way.
+     */
+    protected function detectBrowserFromClientHints(string $secChUa, string $userAgent): ?array
+    {
+        preg_match_all('/"([^"]+)"\s*;\s*v="([^"]*)"/', $secChUa, $matches, PREG_SET_ORDER);
+
+        $brands = [];
+        foreach ($matches as $match) {
+            $brands[$match[1]] = $match[2];
+        }
+
+        // Most specific brand first; "chromium" only when nothing else matches.
+        $known = [
+            'brave'            => 'Brave',
+            'microsoft edge'   => 'Microsoft Edge',
+            'opera gx'         => 'Opera GX',
+            'opera'            => 'Opera',
+            'vivaldi'          => 'Vivaldi',
+            'samsung internet' => 'Samsung Internet',
+            'duckduckgo'       => 'DuckDuckGo Browser',
+            'google chrome'    => 'Google Chrome',
+            'chromium'         => 'Chromium',
+        ];
+
+        foreach ($known as $brand => $name) {
+            if (array_key_exists($brand, $brands)) {
+                return [
+                    'name'    => $name,
+                    'version' => $this->extractVersion($userAgent, $name) ?: $brands[$brand],
+                ];
+            }
+        }
+
+        return null;
     }
 
     protected function extractVersion(string $userAgent, string $browser): string
@@ -440,9 +536,14 @@ class LaraTrack
         return strtolower($this->request->header('User-Agent', ''));
     }
 
+    /**
+     * The client IP as Laravel resolves it. Headers such as X-Real-IP or
+     * X-Forwarded-For are only honoured for proxies listed in the app's
+     * TrustProxies setup, so a visitor cannot fake their own IP.
+     */
     protected function getIp(): string
     {
-        return $this->request->header('X-Real-IP', $this->request->ip());
+        return (string) $this->request->ip();
     }
 
     public function getBrowser(?Request $request = null): string    { return $this->detect($request)['browser']; }
